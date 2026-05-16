@@ -53,6 +53,7 @@ var (
 	customPath   string
 	customFiles  []string
 	fastMode     bool
+	menubarMode  bool
 	minAmplitude float64
 	minJerk      float64
 	cooldownMs   int
@@ -261,6 +262,9 @@ within a minute, the more intense the sounds become.`,
 			if cmd.Flags().Changed("cooldown") {
 				tuning.cooldown = time.Duration(cooldownMs) * time.Millisecond
 			}
+			if menubarMode {
+				return runMenuBar(cmd.Context(), tuning)
+			}
 			return run(cmd.Context(), tuning)
 		},
 		SilenceUsage: true,
@@ -271,6 +275,7 @@ within a minute, the more intense the sounds become.`,
 	cmd.Flags().BoolVarP(&lizardMode, "lizard", "l", false, "Enable lizard mode (escalating intensity)")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
+	cmd.Flags().BoolVar(&menubarMode, "menubar", false, "Run with a macOS menu bar icon for enable/disable and sensitivity control")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().Float64Var(&minJerk, "min-jerk", defaultMinJerk, "Minimum jerk threshold in g/s; higher = only hard slaps trigger, 0 = disable (default 8.0)")
@@ -282,6 +287,76 @@ within a minute, the more intense the sounds become.`,
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
 	}
+}
+
+// buildPack constructs the sound pack from the current mode globals.
+func buildPack() (*soundPack, error) {
+	var pack *soundPack
+	switch {
+	case len(customFiles) > 0:
+		for _, f := range customFiles {
+			if !strings.HasSuffix(strings.ToLower(f), ".mp3") {
+				return nil, fmt.Errorf("custom file must be MP3: %s", f)
+			}
+			if _, err := os.Stat(f); err != nil {
+				return nil, fmt.Errorf("custom file not found: %s", f)
+			}
+		}
+		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: customFiles}
+	case customPath != "":
+		pack = &soundPack{name: "custom", dir: customPath, mode: modeRandom, custom: true}
+	case sexyMode:
+		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
+	case haloMode:
+		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
+	case lizardMode:
+		pack = &soundPack{name: "lizard", fs: lizardAudio, dir: "audio/lizard", mode: modeEscalation}
+	default:
+		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
+	}
+	if len(pack.files) == 0 {
+		if err := pack.loadFiles(); err != nil {
+			return nil, fmt.Errorf("loading %s audio: %w", pack.name, err)
+		}
+	}
+	return pack, nil
+}
+
+// startSensor creates shared memory, starts the sensor worker, and waits for
+// it to be ready. Returns nil accelRing (no error) if ctx is cancelled before
+// the sensor starts. Caller owns accelRing and must Close+Unlink it.
+func startSensor(ctx context.Context) (*shm.RingBuffer, error) {
+	accelRing, err := shm.CreateRing(shm.NameAccel)
+	if err != nil {
+		return nil, fmt.Errorf("creating accel shm: %w", err)
+	}
+
+	// sensor.Run() needs runtime.LockOSThread for CFRunLoop, which it
+	// handles internally.
+	go func() {
+		close(sensorReady)
+		if err := sensor.Run(sensor.Config{
+			AccelRing: accelRing,
+			Restarts:  0,
+		}); err != nil {
+			sensorErr <- err
+		}
+	}()
+
+	select {
+	case <-sensorReady:
+	case err := <-sensorErr:
+		accelRing.Close()
+		accelRing.Unlink()
+		return nil, fmt.Errorf("sensor worker failed: %w", err)
+	case <-ctx.Done():
+		accelRing.Close()
+		accelRing.Unlink()
+		return nil, nil
+	}
+
+	time.Sleep(sensorStartupDelay)
+	return accelRing, nil
 }
 
 func run(ctx context.Context, tuning runtimeTuning) error {
@@ -313,73 +388,23 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		return fmt.Errorf("--cooldown must be greater than 0")
 	}
 
-	var pack *soundPack
-	switch {
-	case len(customFiles) > 0:
-		// Validate all files exist and are MP3s
-		for _, f := range customFiles {
-			if !strings.HasSuffix(strings.ToLower(f), ".mp3") {
-				return fmt.Errorf("custom file must be MP3: %s", f)
-			}
-			if _, err := os.Stat(f); err != nil {
-				return fmt.Errorf("custom file not found: %s", f)
-			}
-		}
-		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: customFiles}
-	case customPath != "":
-		pack = &soundPack{name: "custom", dir: customPath, mode: modeRandom, custom: true}
-	case sexyMode:
-		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
-	case haloMode:
-		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
-	case lizardMode:
-		pack = &soundPack{name: "lizard", fs: lizardAudio, dir: "audio/lizard", mode: modeEscalation}
-	default:
-		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
-	}
-
-	// Only load files if not already set (customFiles case)
-	if len(pack.files) == 0 {
-		if err := pack.loadFiles(); err != nil {
-			return fmt.Errorf("loading %s audio: %w", pack.name, err)
-		}
+	pack, err := buildPack()
+	if err != nil {
+		return err
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Create shared memory for accelerometer data.
-	accelRing, err := shm.CreateRing(shm.NameAccel)
+	accelRing, err := startSensor(ctx)
 	if err != nil {
-		return fmt.Errorf("creating accel shm: %w", err)
+		return err
+	}
+	if accelRing == nil {
+		return nil
 	}
 	defer accelRing.Close()
 	defer accelRing.Unlink()
-
-	// Start the sensor worker in a background goroutine.
-	// sensor.Run() needs runtime.LockOSThread for CFRunLoop, which it
-	// handles internally. We launch detection on the current goroutine.
-	go func() {
-		close(sensorReady)
-		if err := sensor.Run(sensor.Config{
-			AccelRing: accelRing,
-			Restarts:  0,
-		}); err != nil {
-			sensorErr <- err
-		}
-	}()
-
-	// Wait for sensor to be ready.
-	select {
-	case <-sensorReady:
-	case err := <-sensorErr:
-		return fmt.Errorf("sensor worker failed: %w", err)
-	case <-ctx.Done():
-		return nil
-	}
-
-	// Give the sensor a moment to start producing data.
-	time.Sleep(sensorStartupDelay)
 
 	return listenForSlaps(ctx, pack, accelRing, tuning)
 }
@@ -467,10 +492,10 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		if time.Since(lastYell) <= time.Duration(cooldownMs)*time.Millisecond {
 			continue
 		}
-		if ev.Amplitude < tuning.minAmplitude {
+		if ev.Amplitude < minAmplitude {
 			continue
 		}
-		if tuning.minJerk > 0 && maxBatchJerk < tuning.minJerk {
+		if minJerk > 0 && maxBatchJerk < minJerk {
 			continue
 		}
 
@@ -595,10 +620,11 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 
 // stdinCommand represents a command received via stdin
 type stdinCommand struct {
-	Cmd       string  `json:"cmd"`
-	Amplitude float64 `json:"amplitude,omitempty"`
-	Cooldown  int     `json:"cooldown,omitempty"`
-	Speed     float64 `json:"speed,omitempty"`
+	Cmd       string   `json:"cmd"`
+	Amplitude float64  `json:"amplitude,omitempty"`
+	Cooldown  int      `json:"cooldown,omitempty"`
+	Speed     float64  `json:"speed,omitempty"`
+	MinJerk   *float64 `json:"min_jerk,omitempty"`
 }
 
 // readStdinCommands reads JSON commands from stdin for live control
@@ -649,8 +675,11 @@ func processCommands(r io.Reader, w io.Writer) {
 			if cmd.Speed > 0 {
 				speedRatio = cmd.Speed
 			}
+			if cmd.MinJerk != nil && *cmd.MinJerk >= 0 {
+				minJerk = *cmd.MinJerk
+			}
 			if stdioMode {
-				fmt.Fprintf(w, `{"status":"settings_updated","amplitude":%.4f,"cooldown":%d,"speed":%.2f}%s`, minAmplitude, cooldownMs, speedRatio, "\n")
+				fmt.Fprintf(w, `{"status":"settings_updated","amplitude":%.4f,"cooldown":%d,"speed":%.2f,"min_jerk":%.1f}%s`, minAmplitude, cooldownMs, speedRatio, minJerk, "\n")
 			}
 		case "volume-scaling":
 			volumeScaling = !volumeScaling
