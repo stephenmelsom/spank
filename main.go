@@ -54,6 +54,7 @@ var (
 	customFiles  []string
 	fastMode     bool
 	minAmplitude float64
+	minJerk      float64
 	cooldownMs   int
 	stdioMode      bool
 	volumeScaling  bool
@@ -82,7 +83,12 @@ const (
 	decayHalfLife = 30.0
 
 	// defaultMinAmplitude is the default detection threshold.
-	defaultMinAmplitude = 0.05
+	defaultMinAmplitude = 0.10
+
+	// defaultMinJerk is the minimum rate of acceleration change (g/s) required
+	// to qualify as a slap. Filters out slow movements like tilting or picking up
+	// the laptop. Slaps typically exceed 10 g/s; tilts are usually under 2 g/s.
+	defaultMinJerk = 50.0
 
 	// defaultCooldownMs is the default cooldown between audio responses.
 	defaultCooldownMs = 750
@@ -103,6 +109,7 @@ const (
 
 type runtimeTuning struct {
 	minAmplitude float64
+	minJerk      float64
 	cooldown     time.Duration
 	pollInterval time.Duration
 	maxBatch     int
@@ -111,6 +118,7 @@ type runtimeTuning struct {
 func defaultTuning() runtimeTuning {
 	return runtimeTuning{
 		minAmplitude: defaultMinAmplitude,
+		minJerk:      defaultMinJerk,
 		cooldown:     time.Duration(defaultCooldownMs) * time.Millisecond,
 		pollInterval: defaultSensorPollInterval,
 		maxBatch:     defaultMaxSampleBatch,
@@ -247,6 +255,9 @@ within a minute, the more intense the sounds become.`,
 			if cmd.Flags().Changed("min-amplitude") {
 				tuning.minAmplitude = minAmplitude
 			}
+			if cmd.Flags().Changed("min-jerk") {
+				tuning.minJerk = minJerk
+			}
 			if cmd.Flags().Changed("cooldown") {
 				tuning.cooldown = time.Duration(cooldownMs) * time.Millisecond
 			}
@@ -262,6 +273,7 @@ within a minute, the more intense the sounds become.`,
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
+	cmd.Flags().Float64Var(&minJerk, "min-jerk", defaultMinJerk, "Minimum jerk threshold in g/s; higher = only hard slaps trigger, 0 = disable (default 8.0)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
@@ -379,6 +391,8 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	var lastAccelTotal uint64
 	var lastEventTime time.Time
 	var lastYell time.Time
+	var prevMag float64
+	var maxBatchJerk float64
 
 	// Start stdin command reader if in JSON mode
 	if stdioMode {
@@ -424,10 +438,20 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 			samples = samples[len(samples)-tuning.maxBatch:]
 		}
 
+		maxBatchJerk = 0
 		nSamples := len(samples)
 		for idx, sample := range samples {
 			tSample := tNow - float64(nSamples-idx-1)/float64(det.FS)
 			det.Process(sample.X, sample.Y, sample.Z, tSample)
+
+			mag := math.Sqrt(sample.X*sample.X + sample.Y*sample.Y + sample.Z*sample.Z)
+			if prevMag > 0 {
+				delta := math.Abs(mag-prevMag) * float64(det.FS) // g/s
+				if delta > maxBatchJerk {
+					maxBatchJerk = delta
+				}
+			}
+			prevMag = mag
 		}
 
 		if len(det.Events) == 0 {
@@ -443,7 +467,10 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		if time.Since(lastYell) <= time.Duration(cooldownMs)*time.Millisecond {
 			continue
 		}
-		if ev.Amplitude < minAmplitude {
+		if ev.Amplitude < tuning.minAmplitude {
+			continue
+		}
+		if tuning.minJerk > 0 && maxBatchJerk < tuning.minJerk {
 			continue
 		}
 
